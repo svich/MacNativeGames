@@ -1577,7 +1577,8 @@ static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
    attachment loaded again (~80 copy encoders and ~23 split passes per frame in the East Reservoir scene). Now an update
    stages its bytes in the submission arena and is logged. A draw or dispatch that binds a uniform range overlapping
    logged updates gets a private copy of that range: memory plus every pending write in order (pend_materialize), so
-   draws before an update read the old bytes and draws after it the new ones. The logged updates reach memory at the end
+   draws before an update read the old bytes and draws after it the new ones. Range here means the bytes the shader reads
+   (ubo_window, 2026-10-23): updates past them need no copy for that draw. The logged updates reach memory at the end
    of the submission, or earlier when anything other than a uniform binding (vertex / index / storage / texture buffer,
    buffer copy, built-in kernel) touches an updated range; that check runs before the draw opens its encoder.
    Overlapping updates are merged and written once per merged range, so copies in one encoder never race.
@@ -1733,6 +1734,12 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
     if(indexed)g_shadow_index[slot]=(uint16_t)g_nshadow;
     g_ren_shadows++; g_ren_bytes += size;
     return gpu;
+}
+/* The part of a uniform binding of `size` bytes its shader can read (nvn_rbind.rd, msl_read_extents): a renamed copy and its
+   overlap check cover only that. TOTK_UB_WINDOW=0 copies whole bound ranges again. */
+static uint64_t ubo_window(uint64_t size, uint16_t rd) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_UB_WINDOW"); on = !(e && !strcmp(e, "0")); }
+    return on && rd && rd < size ? rd : size;
 }
 static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     void *db; uint64_t dof;
@@ -5112,6 +5119,58 @@ static void refl_mark_stores(NvShader *o, NSArray *bs, NSString *src) {
         if (msl_stores_through(src, d[@"msl_name"])) b->rw = 1;
     }
 }
+/* TOTK (2026-10-23): how far into each uniform binding a shader reads, so a renamed inline update (upd_shadow) copies only
+   those bytes and an update past them needs no copy for that draw. The game binds ranges of ~25 KB on average and updates
+   tens to hundreds of bytes of them; over the v143 seed (33,264 variants) 90% of uniform slots are read only at constant
+   indices, median extent 496 bytes, at most 3,248. spirv-cross declares a user uniform block <st>_c3..c16 as a struct of
+   one float4 array _m0 and a compute uniform pointer cp_sN as one uint array; every reference to the binding must be
+   "(*spvDescriptorSet0.<name>)._m0[<integer>]", otherwise (computed index, pointer taken, another layout) the extent is
+   unknown: 0, the whole bound range. One pass over the source for all bindings (names[i], types[i] = msl_name, msl_type). */
+static int g_rd_ignore_dynamic;   // probe-gpu-ub-rename negative control only: computed indices do not count
+static void msl_read_extents(const char *s, int n, const char *const *names, const char *const *types, uint16_t *out) {
+    uint32_t hi[NVN_REFL_MAXB] = {0}; uint8_t esz[NVN_REFL_MAXB] = {0}, bad[NVN_REFL_MAXB] = {0};
+    if (n > NVN_REFL_MAXB) n = NVN_REFL_MAXB;
+    for (int i = 0; i < n; i++) {   // element size from "struct _16\n{\n    float4 _m0[4096];\n};"
+        out[i] = 0; if (!s || !names[i] || !types[i]) continue;
+        const char *t = strrchr(types[i], ' '); t = t ? t + 1 : types[i];
+        int tl = (int)strcspn(t, "*"); char pat[96];
+        if (!tl || tl > 64) continue;
+        snprintf(pat, sizeof pat, "struct %.*s\n{\n    ", tl, t);
+        const char *d = strstr(s, pat); if (!d) continue;
+        d += strlen(pat);
+        int e = !strncmp(d, "float4 _m0[", 11) || !strncmp(d, "uint4 _m0[", 10) || !strncmp(d, "int4 _m0[", 9) ? 16 :
+                !strncmp(d, "float _m0[", 10) || !strncmp(d, "uint _m0[", 9) || !strncmp(d, "int _m0[", 8) ? 4 : 0;
+        const char *semi = strchr(d, ';');
+        if (e && semi && !strncmp(semi, ";\n};", 4)) esz[i] = (uint8_t)e;   // the array is the only member
+    }
+    static const char key[] = "spvDescriptorSet0."; const size_t kl = sizeof key - 1;
+    for (const char *p = s ? strstr(s, key) : NULL; p; p = strstr(p + kl, key)) {
+        const char *q = p + kl; size_t nl = 0;
+        for (char c; (c = q[nl]) && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'); ) nl++;
+        int i = 0; for (; i < n; i++) if (esz[i] && strlen(names[i]) == nl && !strncmp(names[i], q, nl)) break;
+        if (i == n) continue;
+        q += nl;
+        if (p - s < 2 || p[-2] != '(' || p[-1] != '*' || strncmp(q, ")._m0[", 6)) { bad[i] = 1; continue; }
+        q += 6; char *end; unsigned long idx = strtoul(q, &end, 10);
+        if (end == q || *q < '0' || *q > '9') { if (!g_rd_ignore_dynamic) bad[i] = 1; continue; }   // a computed index
+        if (*end == 'u') end++;
+        if (*end != ']' || idx >= 65536) { bad[i] = 1; continue; }
+        if ((idx + 1) * esz[i] > hi[i]) hi[i] = (uint32_t)((idx + 1) * esz[i]);
+    }
+    for (int i = 0; i < n; i++) out[i] = esz[i] && !bad[i] && hi[i] <= 0xffff ? (uint16_t)hi[i] : 0;
+}
+static void refl_read_extents(NvShader *o, NSArray *bs, NSString *src) {
+    if (![bs isKindOfClass:[NSArray class]] || (int)bs.count != o->rf.nb) return;   // nvn_refl_from_json keeps the json order 1:1
+    const char *names[NVN_REFL_MAXB] = {0}, *types[NVN_REFL_MAXB] = {0}; uint16_t rd[NVN_REFL_MAXB];
+    for (int i = 0; i < o->rf.nb; i++) {
+        const nvn_rbind *b = &o->rf.b[i]; if (b->kind != NVN_RB_CBUF && b->kind != NVN_RB_UBOP) continue;
+        NSDictionary *d = bs[(NSUInteger)i]; if (![d isKindOfClass:[NSDictionary class]]) continue;
+        NSString *nm = d[@"msl_name"], *ty = d[@"msl_type"];
+        if ([nm isKindOfClass:[NSString class]] && [ty isKindOfClass:[NSString class]]) { names[i] = nm.UTF8String; types[i] = ty.UTF8String; }
+    }
+    msl_read_extents(src.UTF8String, o->rf.nb, names, types, rd);
+    for (int i = 0; i < o->rf.nb; i++) o->rf.b[i].rd = rd[i];
+}
 static int drv_scan(NvShader *o, NSString *src) {   // src: the full MSL (iOS does not keep it in o->src)
     const char *s = src.UTF8String; if (!s) return 0;
     int nunfill = 0;
@@ -5191,7 +5250,7 @@ static NvShader *shader_load(NSString *pc, int stage) {
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     NSString *full = rt ? [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:nil] : nil;
     o->writes_depth = full && [full rangeOfString:@"[[depth("].location != NSNotFound;
-    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores
+    if (full) { o->src_path = rt_src; drv_scan(o, full); refl_mark_stores(o, j[@"bindings"], full); refl_read_extents(o, j[@"bindings"], full); }   // TOTK: scan before iOS drops the source (NPC-culling fix needs it there too); rw from the MSL's stores; uniform read extents
     /* TOTK (2026-10-17): the MSL is read again from its file when a variant needs it (sh_src), on the Mac too -- keeping
        every source cost 255 MB of strings (7,691 of them) in a long session (analysis/long18 heap). TOTK_KEEP_MSL=1 keeps
        them in memory (the Mac's behaviour before). */
@@ -8083,7 +8142,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
             use_rec("buf", u->addr, u->size, 0, NULL);
-            uint64_t ren = g_nupd ? upd_shadow(u->addr, u->size) : 0;   // TOTK: renamed inline updates (see upd_shadow)
+            uint64_t ren = g_nupd ? upd_shadow(u->addr, bl ? u->size : ubo_window(u->size, b->rd)) : 0;   // TOTK: renamed inline updates (see upd_shadow), only the bytes the shader reads (DM_NVN_CBDUMP saves the whole range)
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI 矩阵修补读的是内存，跳过了含内联更新的 uniform 副本"); }
             else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
@@ -8193,7 +8252,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
               if (wsb && !wsb_done && u && u->addr && reg == wsb_reg && sh && sh->key && !strncmp(sh->key, wsb, strlen(wsb))) { extern void runtime_watch_set(uintptr_t, size_t); runtime_watch_set((uintptr_t)u->addr, (size_t)u->size); wsb_done = 1; MLOG("[watch] armed on storage buffer reg%d of %.16s addr=%#llx size=%llu", reg, sh->key, (unsigned long long)u->addr, (unsigned long long)u->size); } }
             uint64_t ren = 0;
             if (u && u->addr && g_nupd) {   // TOTK: renamed inline updates: uniforms read the private copy; storage access must already see memory
-                if (b->kind == NVN_RB_UBOP) ren = upd_shadow(u->addr, u->size);
+                if (b->kind == NVN_RB_UBOP) ren = upd_shadow(u->addr, ubo_window(u->size, b->rd));
                 else if (upd_overlap_seq(u->addr, u->addr + (u->size ? u->size : 1))) { g_ren_late++; RED_ONCE(59, "存储缓冲 %#llx 在编码器打开后才发现与待写入的 uniform 更新重叠", (unsigned long long)u->addr); }
             }
             if (b->kind == NVN_RB_SBUFP && b->rw && u && u->addr) usnap_drop(u->addr, u->size ? u->size : 1);   // TOTK: the shader may write it: no stale uniform copy from here on
@@ -14448,7 +14507,15 @@ int mtl_probe_texture_retire(void) {
    it, and after a second overlapping update: the reads must see the old, new and newest bytes; a buffer copy of the range
    in between must see the first update (the copy flushes the logged updates first); memory holds the newest bytes after the
    submission; an update marks the argument buffers dirty. Reads are compute dispatches from the address a draw would bind.
-   TOTK_PROBE_NEGATIVE=1 binds memory instead of the private copy, =2 skips the check before the copy; both must fail. */
+   TOTK_PROBE_NEGATIVE=1 binds memory instead of the private copy, =2 skips the check before the copy; both must fail.
+   Read windows (msl_read_extents, ubo_window) last: see the comment there; =3 must fail too. */
+static void ubw_read(id<MTLComputePipelineState> ps, uint64_t gpu, uint64_t addr, uint64_t n, id<MTLBuffer> out, uint64_t off) {
+    void *mb; uint64_t mo;   // gpu 0: no private copy, the draw would bind memory
+    if (!gpu && !mtl_gpu_addr(addr, n, &mb, &mo, &gpu)) MDIE("ub window probe: range not in the pool");
+    rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); enc_c_pso(ce, ps); enc_c_args(ce, gpu, 0); enc_c_args(ce, out.gpuAddress + off, 1);
+    [ce dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)]; enc_c_end(ce);
+}
 int mtl_probe_ub_rename(void) {
     mtl_init(); setenv("TOTK_UB_RENAME", "1", 1);
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int neg = ne ? atoi(ne) : 0, checked = 0;
@@ -14549,6 +14616,60 @@ int mtl_probe_ub_rename(void) {
         if(((uint8_t *)out.contents)[256+step*128+i]!=want[1][i])MDIE("ub same probe: read %d byte %d = %#x, expected %#x",step,i,((uint8_t *)out.contents)[256+step*128+i],want[1][i]);checked++;
     }
     for(int i=0;i<96;i++){ if(mem[256+i]!=want[1][i] || mem[4096+i]!=want[1][i])MDIE("ub same probe: memory byte %d",i);checked++; }
+    /* Read windows. The scanner on a small MSL: constant reads give the extent (16-byte float4s, 4-byte words for a compute
+       uniform pointer), fp_c4 stays apart from fp_c14; a computed index, a pointer use, no read, an extent past 64 KiB, a
+       struct of two arrays and a binding without a name give 0. Then a binding of 1024 bytes whose shader reads its first 64:
+       an update past them makes no copy and the read sees memory; an update inside them is copied as 64 bytes and seen; a
+       binding read at a computed index is copied whole and sees both. TOTK_PROBE_NEGATIVE=3 lets the scanner skip computed
+       indices: that binding gets a 48-byte window, and its read past it misses the update. */
+    static const char *wmsl =
+        "struct _16\n{\n    float4 _m0[4096];\n};\n\nstruct _23\n{\n    uint _m0[1];\n};\n\nstruct _30\n{\n    float4 _m0[16];\n    float4 _m1[16];\n};\n\n"
+        "struct spvDescriptorSetBuffer0\n{\n    constant _16* fp_c3 [[id(0)]];\n    constant _16* fp_c4 [[id(1)]];\n    constant _16* fp_c14 [[id(2)]];\n"
+        "    constant _16* fp_c5 [[id(3)]];\n    device _23* cp_s0 [[id(4)]];\n    constant _16* fp_c6 [[id(5)]];\n    constant _16* fp_c7 [[id(6)]];\n"
+        "    constant _16* fp_c8 [[id(7)]];\n    constant _30* fp_c9 [[id(8)]];\n};\n\n"
+        "fragment void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]])\n{\n"
+        "    float a = (*spvDescriptorSet0.fp_c3)._m0[3].x + (*spvDescriptorSet0.fp_c3)._m0[1u].w;\n"
+        "    float b = (*spvDescriptorSet0.fp_c4)._m0[1].y + (*spvDescriptorSet0.fp_c14)._m0[200].z;\n"
+        "    int _7 = int(a);\n    float c = (*spvDescriptorSet0.fp_c5)._m0[2].x + (*spvDescriptorSet0.fp_c5)._m0[int(_7)].z;\n"
+        "    uint d = (*spvDescriptorSet0.cp_s0)._m0[8];\n    constant _16* e = spvDescriptorSet0.fp_c6;\n"
+        "    float f = (*spvDescriptorSet0.fp_c8)._m0[5000].x + (*spvDescriptorSet0.fp_c9)._m0[1].x;\n}\n";
+    const char *wn[10] = {"fp_c3", "fp_c4", "fp_c14", "fp_c5", "cp_s0", "fp_c6", "fp_c7", "fp_c8", "fp_c9", NULL};
+    const char *wt[10] = {"constant _16*", "constant _16*", "constant _16*", "constant _16*", "device _23*", "constant _16*", "constant _16*", "constant _16*", "constant _30*", NULL};
+    const uint16_t want_rd[10] = {64, 32, 3216, 0, 36, 0, 0, 0, 0, 0};
+    uint16_t wr[10]; g_rd_ignore_dynamic = neg == 3; msl_read_extents(wmsl, 10, wn, wt, wr); g_rd_ignore_dynamic = 0;
+    const uint64_t wb = (uint64_t)(uintptr_t)mem + 8192, wsize = 1024;
+    const uint64_t win = ubo_window(wsize, wr[0]), wdyn = ubo_window(wsize, wr[3]);
+    if (win != 64) MDIE("ub window probe: window %llu, expected 64", (unsigned long long)win); checked++;
+    id<MTLBuffer> wout = probe_buf(3 * 1024);
+    uint8_t ua[16], ub[16]; memset(ua, 0x55, sizeof ua); memset(ub, 0x66, sizeof ub);
+    mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+    mtl_sub_update(ua, wb + 512, sizeof ua);
+    uint64_t shadows = g_ren_shadows, bytes = g_ren_bytes;
+    if (!upd_overlap_seq(wb, wb + wsize)) MDIE("ub window probe: the update is not logged in the bound range"); checked++;
+    uint64_t g0 = upd_shadow(wb, win);
+    if (g0 || g_ren_shadows != shadows) MDIE("ub window probe: an update past the window made a copy"); checked++;
+    ubw_read(ps, g0, wb, win, wout, 0);
+    mtl_sub_update(ub, wb + 16, sizeof ub);
+    uint64_t g1 = upd_shadow(wb, win);
+    if (!g1 || g_ren_shadows != shadows + 1 || g_ren_bytes != bytes + win) MDIE("ub window probe: an update inside the window was not copied as %llu bytes", (unsigned long long)win); checked++;
+    ubw_read(ps, g1, wb, win, wout, 1024);
+    uint64_t g2 = upd_shadow(wb, wdyn);
+    if (!g2) MDIE("ub window probe: no copy for the binding read at a computed index"); checked++;
+    ubw_read(ps, g2, wb, wsize, wout, 2048);
+    mtl_sub_commit(); mtl_finish();
+    for (int r = 0; r < 3; r++) for (uint64_t i = 0; i < (r < 2 ? win : wsize); i++) {
+        uint8_t expected = r && i >= 16 && i < 32 ? 0x66 : r == 2 && i >= 512 && i < 528 ? 0x55 : 0x11;
+        uint8_t got = ((const uint8_t *)wout.contents)[r * 1024 + i];
+        if (got != expected) MDIE("ub window probe: read %d byte %llu = %#x, expected %#x", r, (unsigned long long)i, got, expected);
+        checked++;
+    }
+    for (uint64_t i = 0; i < wsize; i++) {
+        uint8_t expected = i >= 16 && i < 32 ? 0x66 : i >= 512 && i < 528 ? 0x55 : 0x11;
+        if (mem[8192 + i] != expected) MDIE("ub window probe: memory byte %llu = %#x after the submission, expected %#x", (unsigned long long)i, mem[8192 + i], expected);
+        checked++;
+    }
+    for (int i = 0; i < 10; i++) { if (wr[i] != want_rd[i]) MDIE("ub window probe: %s read extent %u, expected %u", wn[i] ? wn[i] : "(no name)", (unsigned)wr[i], (unsigned)want_rd[i]); checked++; }
+    if (ubo_window(16, 64) != 16 || ubo_window(1024, 0) != 1024) MDIE("ub window probe: a window past the binding or for an unknown extent"); checked++;
     mtl_pool_del(mem); return checked;
 }
 
