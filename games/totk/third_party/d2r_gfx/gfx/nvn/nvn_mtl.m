@@ -1584,13 +1584,13 @@ static size_t arena_alloc(size_t n, id<MTLBuffer> *buf);
    TOTK_UB_RENAME=0 keeps the per-update GPU copies. */
 static inline void args_dirty_all(void);
 static void upd_dirty_stages(uint64_t lo, uint64_t hi);
-typedef struct { uint64_t lo, hi, seq; } upd_ent;
+typedef struct { uint64_t lo, hi, seq; const uint8_t *src; } upd_ent;   // src: the update's bytes in the submission arena
 static upd_ent *g_upd; static int g_nupd, g_updcap; static uint64_t g_upd_lo = UINT64_MAX, g_upd_hi, g_upd_seq;
 /* g_upd is kept sorted by lo (insertion with memmove; a few hundred entries per submission) with g_upd_maxhi[i] = largest hi
    in g_upd[0..i], so an overlap query is a binary search plus a backwards walk over actual overlaps: every uniform binding
    of the frame (over ten thousand) is checked, and most overlap nothing. */
 static uint64_t *g_upd_maxhi;
-static void upd_insert(uint64_t lo, uint64_t hi) {
+static void upd_insert(uint64_t lo, uint64_t hi, const uint8_t *src) {
     if (g_nupd == g_updcap) {
         g_updcap = g_updcap ? g_updcap * 2 : 256;
         g_upd = realloc(g_upd, (size_t)g_updcap * sizeof *g_upd); g_upd_maxhi = realloc(g_upd_maxhi, (size_t)g_updcap * sizeof *g_upd_maxhi);
@@ -1598,18 +1598,20 @@ static void upd_insert(uint64_t lo, uint64_t hi) {
     }
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo <= lo) a = m + 1; else b = m; }
     memmove(g_upd + a + 1, g_upd + a, (size_t)(g_nupd - a) * sizeof *g_upd);
-    g_upd[a] = (upd_ent){lo, hi, ++g_upd_seq}; g_nupd++;
+    g_upd[a] = (upd_ent){lo, hi, ++g_upd_seq, src}; g_nupd++;
     for (int i = a; i < g_nupd; i++) { uint64_t prev = i ? g_upd_maxhi[i - 1] : 0; g_upd_maxhi[i] = g_upd[i].hi > prev ? g_upd[i].hi : prev; }
     if (lo < g_upd_lo) g_upd_lo = lo; if (hi > g_upd_hi) g_upd_hi = hi;
 }
-// Newest seq among logged updates overlapping [lo, hi), 0 when none.
-static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
-    if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
+// Newest logged update overlapping [lo, hi), NULL when none.
+static const upd_ent *upd_overlap_newest(uint64_t lo, uint64_t hi) {
+    if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return NULL;
     int a = 0, b = g_nupd; while (a < b) { int m = (a + b) >> 1; if (g_upd[m].lo < hi) a = m + 1; else b = m; }   // entries [0, a) start below hi
-    uint64_t last = 0;
-    for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
+    const upd_ent *last = NULL;
+    for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && (!last || g_upd[i].seq > last->seq)) last = &g_upd[i];
     return last;
 }
+// Newest seq among logged updates overlapping [lo, hi), 0 when none.
+static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) { const upd_ent *e = upd_overlap_newest(lo, hi); return e ? e->seq : 0; }
 typedef struct { uint64_t lo, size, seq, gpu; } ubo_shadow;
 #define UBO_SHADOW_MAX 512
 static ubo_shadow g_shadow[UBO_SHADOW_MAX]; static int g_nshadow;
@@ -1630,13 +1632,28 @@ static unsigned shadow_index_slot(uint64_t lo, uint64_t size) {
     uint64_t h=(lo >> 4) ^ (lo >> 19) ^ (size * UINT64_C(0x9e3779b97f4a7c15));
     return (unsigned)(h ^ (h >> 32)) & (SHADOW_INDEX_N-1);
 }
-static uint64_t g_ren_updates, g_ren_shadows, g_ren_bytes, g_ren_flushes, g_ren_late, g_ren_fallback;
+static uint64_t g_ren_updates, g_ren_shadows, g_ren_bytes, g_ren_flushes, g_ren_late, g_ren_fallback, g_ren_same;
 static int ub_rename_on(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("TOTK_UB_RENAME"); v = !(e && !strcmp(e, "0")); MLOG("TOTK: inline uniform updates %s", v ? "renamed per binding (render passes stay open)" : "copied on the GPU timeline (TOTK_UB_RENAME=0)"); }
     return v;
 }
-void mtl_ren_stats(uint64_t v[6]) { v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; }
+/* An inline update whose bytes equal those of the newest logged update covering its whole range changes nothing the GPU
+   will read: it is dropped, so bindings keep the private copy they have instead of copying the whole range again.
+   TOTK_UB_SAME=0 logs every update. */
+static int ub_same_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_UB_SAME"); v = !(e && !strcmp(e, "0")); }
+    return v;
+}
+static int g_upd_same_any;   // probe-gpu-ub-rename negative control only: compare with any covering update, not the newest overlapping one
+static int upd_same(const void *data, uint64_t dst, uint64_t n) {
+    if (!g_nupd || !ub_same_on()) return 0;
+    const upd_ent *e = upd_overlap_newest(dst, dst + n);
+    if (g_upd_same_any) for (int i = 0; i < g_nupd; i++) if (g_upd[i].lo <= dst && g_upd[i].hi >= dst + n) { e = &g_upd[i]; break; }
+    return e && e->lo <= dst && e->hi >= dst + n && !memcmp(e->src + (dst - e->lo), data, (size_t)n);
+}
+void mtl_ren_stats(uint64_t v[7]) { v[0] = g_ren_updates; v[1] = g_ren_shadows; v[2] = g_ren_bytes; v[3] = g_ren_flushes; v[4] = g_ren_late; v[5] = g_ren_fallback; v[6] = g_ren_same; }
 /* Bytes [a, a+n) as the GPU will see them at this point of the submission: memory, then every pending write that the GPU
    has not completed yet, oldest first (inline updates carry their bytes; GPU copies read their source the same way). */
 static void pend_materialize_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait) {
@@ -1722,13 +1739,17 @@ static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     g_upd_n++;
     pd_update_bytes(data, dst, n, g_upd_n);
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform update target not in any memory pool dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
+    if (upd_same(data, dst, n)) {   // nothing changes: no log entry, no new private copies, argument buffers stay valid
+        g_ren_same++; pd_xfer("update", 0, dst, n); anom_note_xfer('U', 0, dst, n, data);
+        return;
+    }
     id<MTLBuffer> sb; size_t so = arena_alloc((size_t)n, &sb);
     memcpy((uint8_t *)sb.contents + so, data, (size_t)n);
     pend_note(dst, n, (const uint8_t *)sb.contents + so, 0);   // the arena copy outlives this submission's replay
     pd_xfer("update", 0, dst, n);
     anom_note_xfer('U', 0, dst, n, data);   // TOTK_ANOMALY
     if (ub_rename_on() && g_npend < PEND_MAX && __atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= g_pend_over_fence) {
-        upd_insert(dst, dst + n);
+        upd_insert(dst, dst + n, (const uint8_t *)sb.contents + so);
         g_ren_updates++;
         upd_dirty_stages(dst, dst + n);   // argument buffers reused inside the pass would still point at the previous version
         return;
@@ -14505,6 +14526,29 @@ int mtl_probe_ub_rename(void) {
         if(((uint8_t *)out.contents)[step*128+i]!=expected)MDIE("shadow index: GPU bytes differ step%d offset%d",step,i);checked++;
     }
     g_shadow_index_stale_probe=0;atomic_store(&g_shadow_index_on,saved_index);
+    /* Updates equal to the newest logged update covering them are dropped: the same range and a part of it keep the
+       private copy. An equal update under a newer different one, and one after a flush, are logged.
+       TOTK_PROBE_NEGATIVE=9 compares with any covering update instead of the newest overlapping one: the read fails. */
+    g_upd_same_any=neg==9;
+    uint8_t u3[16]; memset(u3,0x22,sizeof u3); uint64_t same_before=g_ren_same; memset(mem+4096,0,96);
+    mtl_sub_begin();mtl_exec((const uint8_t *)&end);
+    mtl_sub_update(u1,base+16,64);
+    uint64_t s1=upd_shadow(base,size);
+    mtl_sub_update(u1,base+16,64);mtl_sub_update(u3,base+32,16);
+    if(g_nupd!=1 || g_ren_same!=same_before+2 || upd_shadow(base,size)!=s1)MDIE("ub same probe: equal updates logged (%d entries, %llu dropped)",g_nupd,(unsigned long long)(g_ren_same-same_before));checked++;
+    mtl_sub_update(u2,base+32,16);mtl_sub_update(u3,base+32,16);   // 0x33, then 0x22 again: not equal to the newest
+    uint64_t s3=upd_shadow(base,size);
+    se=enc_c_begin(NULL);enc_c_pso(se,ps);enc_c_args(se,s1,0);enc_c_args(se,out.gpuAddress+256,1);
+    [se dispatchThreads:MTLSizeMake(size,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];enc_c_end(se);
+    se=enc_c_begin(NULL);enc_c_pso(se,ps);enc_c_args(se,s3,0);enc_c_args(se,out.gpuAddress+384,1);
+    [se dispatchThreads:MTLSizeMake(size,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];enc_c_end(se);
+    mtl_sub_copy(base,copy_dst,size);mtl_sub_update(u3,base+32,16);   // the copy flushed the log
+    if(g_nupd!=1)MDIE("ub same probe: update after a flush dropped");checked++;
+    mtl_sub_commit();mtl_finish();g_upd_same_any=0;
+    for(int step=0;step<2;step++)for(int i=0;i<96;i++) {
+        if(((uint8_t *)out.contents)[256+step*128+i]!=want[1][i])MDIE("ub same probe: read %d byte %d = %#x, expected %#x",step,i,((uint8_t *)out.contents)[256+step*128+i],want[1][i]);checked++;
+    }
+    for(int i=0;i<96;i++){ if(mem[256+i]!=want[1][i] || mem[4096+i]!=want[1][i])MDIE("ub same probe: memory byte %d",i);checked++; }
     mtl_pool_del(mem); return checked;
 }
 
