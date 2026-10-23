@@ -1641,11 +1641,11 @@ static int ub_rename_on(void) {
 }
 /* An inline update whose bytes equal those of the newest logged update covering its whole range changes nothing the GPU
    will read: it is dropped, so bindings keep the private copy they have instead of copying the whole range again.
-   TOTK_UB_SAME=0 logs every update. */
+   TOTK_UB_SAME=0 logs every update; DM_NVN_UB can switch g_ub_same in play (@set:g_ub_same=0). */
+int g_ub_same = -1;
 static int ub_same_on(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_UB_SAME"); v = !(e && !strcmp(e, "0")); }
-    return v;
+    if (g_ub_same < 0) { const char *e = getenv("TOTK_UB_SAME"); g_ub_same = !(e && !strcmp(e, "0")); }
+    return g_ub_same;
 }
 static int g_upd_same_any;   // probe-gpu-ub-rename negative control only: compare with any covering update, not the newest overlapping one
 static int upd_same(const void *data, uint64_t dst, uint64_t n) {
@@ -1736,10 +1736,11 @@ static uint64_t upd_shadow(uint64_t lo, uint64_t size) {
     return gpu;
 }
 /* The part of a uniform binding of `size` bytes its shader can read (nvn_rbind.rd, msl_read_extents): a renamed copy and its
-   overlap check cover only that. TOTK_UB_WINDOW=0 copies whole bound ranges again. */
+   overlap check cover only that. TOTK_UB_WINDOW=0 copies whole bound ranges again; DM_NVN_UB can switch g_ub_window in play. */
+int g_ub_window = -1;
 static uint64_t ubo_window(uint64_t size, uint16_t rd) {
-    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_UB_WINDOW"); on = !(e && !strcmp(e, "0")); }
-    return on && rd && rd < size ? rd : size;
+    if (g_ub_window < 0) { const char *e = getenv("TOTK_UB_WINDOW"); g_ub_window = !(e && !strcmp(e, "0")); }
+    return g_ub_window && rd && rd < size ? rd : size;
 }
 static void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     void *db; uint64_t dof;
@@ -1870,7 +1871,8 @@ void mtl_ub_present(double iv) {   // 出图线程每帧调一次：实际上屏
 // so a switch to be measured on a real device must have a line added here; on Mac / in unit tests unregistered ones are still looked up by symbol name.
 static int *ub_var(const char *nm) {
     extern int g_bloom_q, g_dm_present_link;
-    static const struct { const char *n; int *p; } t[] = { {"g_bloom_q", &g_bloom_q}, {"g_dm_present_link", &g_dm_present_link}, {"g_frz_on", &g_frz_on} };
+    static const struct { const char *n; int *p; } t[] = { {"g_bloom_q", &g_bloom_q}, {"g_dm_present_link", &g_dm_present_link}, {"g_frz_on", &g_frz_on},
+                                                          {"g_ub_same", &g_ub_same}, {"g_ub_window", &g_ub_window} };
     for (size_t i = 0; i < sizeof t / sizeof t[0]; i++) if (!strcmp(nm, t[i].n)) return t[i].p;
     return dlsym(RTLD_DEFAULT, nm);
 }
